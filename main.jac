@@ -174,6 +174,23 @@ walker Propose {
     }
 }
 
+# Resume the id counter from the persisted graph so a reopened session
+# doesn't mint ids that collide with existing nodes.
+walker HighWater {
+    has max_id: int = 0;
+
+    can from_root with Root entry {
+        visit [->:Child:-> [?:Turn]];
+    }
+
+    can scan with Turn entry {
+        if here.id > self.max_id {
+            self.max_id = here.id;
+        }
+        visit [->:Child:-> [?:Turn]];
+    }
+}
+
 # Session frontier: walk the whole tree, collect the leaf Turns (open threads).
 walker Frontier {
     has leaves: list[Turn] = [];
@@ -277,6 +294,8 @@ def print_frontier {
 
 with entry:__main__ {
     print("Git-for-Learning REPL. Commands: ask <text> | goto <n> | tree | link <a> <b> | spawn | quit");
+    hw = root spawn HighWater();
+    next_id = hw.max_id;
     print_frontier();
     while True {
         try {
