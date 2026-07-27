@@ -1,8 +1,9 @@
-"""Client UI: the two-panel study app, compiled from Jac to React.
+"""Client UI: the knowledge MAP (clickable node-graph) + a conversation panel.
 
-Left: the knowledge tree (every question, branching where you forked, cursor
-highlighted). Right: the conversation at the node you're standing on - the
-exact ancestor lineage that generated the current answer - plus the ask box.
+Left: an SVG graph of Turn nodes connected by their Child edges - branches
+fan out spatially, the current node and its lineage are highlighted, click any
+node to stand there. Right: the conversation at the node you're standing on
+(its exact ancestor lineage) plus the ask box. Hand-rolled SVG, all Jac.
 """
 sv import from .study { get_tree, ask_from, propose_from, link_nodes, TurnView, AskReply }
 
@@ -13,6 +14,12 @@ glob EXAMPLES: list[str] = [
     "What is entropy in information theory, really?",
 ];
 
+# layout constants (px)
+glob COLW: float = 190.0;
+glob ROWH: float = 120.0;
+glob MX: float = 110.0;
+glob TOPY: float = 54.0;
+
 def:pub StudyShell() -> JsxElement {
     has tree: list[TurnView] = [];
     has cursor: int = 0;
@@ -22,6 +29,20 @@ def:pub StudyShell() -> JsxElement {
 
     async can with entry {
         tree = await get_tree();
+    }
+
+    def lineage_ids() -> list[int] {
+        by_id: dict[int, TurnView] = {};
+        for v in tree {
+            by_id[v.id] = v;
+        }
+        ids: list[int] = [0];
+        cur: int = cursor;
+        while cur != 0 and cur in by_id {
+            ids.append(cur);
+            cur = by_id[cur].parent;
+        }
+        return ids;
     }
 
     def path_to_cursor() -> list[TurnView] {
@@ -95,41 +116,60 @@ def:pub StudyShell() -> JsxElement {
         draft = text;
     }
 
+    pos = layout(tree);
+    pids = lineage_ids();
+
     return <div className="app">
         <header className="topbar">
             <div className="brand">Branch</div>
             <div className="tagline">Chat gives you a transcript. This gives you a map — the answer depends on where you're standing.</div>
         </header>
         <div className="body">
-            <aside className="sidebar">
-                <div className="sidebar-head">
-                    <span>Knowledge tree</span>
-                    <button className="ghost" onClick={lambda (e: MouseEvent) { on_node(0); }}>root</button>
-                </div>
-                {if len(tree) == 0 {
-                    <div className="empty">No branches yet. Ask something on the right to plant the first node.</div>
-                    skip;
-                }}
-                {for v in tree {
-                    <button key={str(v.id)}
-                            className={tree_class(v.id, cursor, v.answer)}
-                            style={{"paddingLeft": str(12 + v.depth * 18) + "px"}}
-                            onClick={lambda (e: MouseEvent) { on_node(v.id); }}>
-                        <span className="node-id">{str(v.id)}</span>
-                        <span className="node-q">{v.question}</span>
-                    </button>
-                }}
-            </aside>
-            <main className="main">
+            <section className="graph">
                 {if link_src >= 0 {
-                    <div className="linkbar">
-                        Linking from node {str(link_src)} — click any tree node to connect it.
+                    <div className="linkbar">Linking from node {str(link_src)} — click any node to connect it.
                         <button className="ghost" onClick={cancel_link}>cancel</button>
                     </div>
                 }}
+                {if len(tree) == 0 {
+                    <div className="empty">Your map is empty. Ask a question on the right to plant the first node — then jump back to it and ask something different to watch it branch.</div>
+                } else {
+                    <div className="canvas">
+                        <svg width={graph_w(tree, pos)} height={graph_h(tree, pos)}>
+                            {for v in tree {
+                                <path key={"e" + str(v.id)}
+                                      className={edge_class(v.id, v.parent, pids)}
+                                      d={edge_path(pos, v.parent, v.id)}
+                                      fill="none" />
+                            }}
+                            <g className={root_class(pids)}
+                               transform={node_tf(pos, 0)}
+                               onClick={lambda (e: MouseEvent) { on_node(0); }}>
+                                <circle r={18} />
+                                <text className="gid" x={0} y={4} textAnchor="middle">root</text>
+                            </g>
+                            {for v in tree {
+                                <g key={"n" + str(v.id)}
+                                   className={node_class(v.id, cursor, pids, v.answer)}
+                                   transform={node_tf(pos, v.id)}
+                                   onClick={lambda (e: MouseEvent) { on_node(v.id); }}>
+                                    <title>{v.question}</title>
+                                    <rect x={-84} y={-26} width={168} height={52} rx={10} />
+                                    <text className="gnum" x={-72} y={-10}>{"#" + str(v.id)}</text>
+                                    <text className="gq" x={-72} y={10}>{trunc(v.question, 22)}</text>
+                                </g>
+                            }}
+                        </svg>
+                    </div>
+                }}
+            </section>
+            <aside className="side">
+                <div className="side-head">
+                    {"Standing at root" if cursor == 0 else "Standing at node " + str(cursor)}
+                </div>
                 <div className="thread">
-                    {if cursor == 0 {
-                        <div className="standing">You are at the root. Ask about a concept you're stuck on.</div>
+                    {if cursor == 0 and len(tree) > 0 {
+                        <div className="standing">Pick a node on the map, or ask a new root-level question below.</div>
                     }}
                     {for v in path_to_cursor() {
                         <div key={str(v.id)} className={turn_class(v.id, cursor)}>
@@ -164,15 +204,108 @@ def:pub StudyShell() -> JsxElement {
                         <button className="primary" onClick={lambda (e: MouseEvent) { submit_ask(); }}>ask</button>
                     </div>
                 </div>
-            </main>
+            </aside>
         </div>
     </div>;
 }
 
-def tree_class(id: int, cursor: int, answer: str) -> str {
-    base = "node";
-    if id == cursor {
+# --- layout + rendering helpers ---------------------------------------------
+
+def build_children(tree: list[TurnView]) -> dict[int, list[int]] {
+    kids: dict[int, list[int]] = {0: []};
+    for v in tree {
+        if v.id not in kids {
+            kids[v.id] = [];
+        }
+    }
+    for v in tree {
+        if v.parent not in kids {
+            kids[v.parent] = [];
+        }
+        kids[v.parent].append(v.id);
+    }
+    return kids;
+}
+
+def _place(nid: int, depth: int, kids: dict[int, list[int]], pos: dict[int, dict[str, float]], counter: list[int]) {
+    cs = kids[nid] if nid in kids else [];
+    if len(cs) == 0 {
+        pos[nid] = {"x": counter[0] * 1.0, "y": depth * 1.0};
+        counter[0] = counter[0] + 1;
+    } else {
+        for c in cs {
+            _place(c, depth + 1, kids, pos, counter);
+        }
+        first = pos[cs[0]]["x"];
+        last = pos[cs[len(cs) - 1]]["x"];
+        pos[nid] = {"x": (first + last) / 2.0, "y": depth * 1.0};
+    }
+}
+
+def layout(tree: list[TurnView]) -> dict[int, dict[str, float]] {
+    kids = build_children(tree);
+    pos: dict[int, dict[str, float]] = {};
+    counter: list[int] = [0];
+    tops = kids[0] if 0 in kids else [];
+    for t in tops {
+        _place(t, 1, kids, pos, counter);
+    }
+    if len(tops) > 0 {
+        rx = (pos[tops[0]]["x"] + pos[tops[len(tops) - 1]]["x"]) / 2.0;
+        pos[0] = {"x": rx, "y": 0.0};
+    } else {
+        pos[0] = {"x": 0.0, "y": 0.0};
+    }
+    return pos;
+}
+
+def node_tf(pos: dict[int, dict[str, float]], nid: int) -> str {
+    px = MX + (pos[nid]["x"] as float) * COLW;
+    py = TOPY + (pos[nid]["y"] as float) * ROWH;
+    return "translate(" + str(px) + "," + str(py) + ")";
+}
+
+def edge_path(pos: dict[int, dict[str, float]], p: int, c: int) -> str {
+    x1 = MX + (pos[p]["x"] as float) * COLW;
+    y1 = TOPY + (pos[p]["y"] as float) * ROWH + 24.0;
+    x2 = MX + (pos[c]["x"] as float) * COLW;
+    y2 = TOPY + (pos[c]["y"] as float) * ROWH - 26.0;
+    my = (y1 + y2) / 2.0;
+    return "M " + str(x1) + " " + str(y1) + " C " + str(x1) + " " + str(my) + " " + str(x2) + " " + str(my) + " " + str(x2) + " " + str(y2);
+}
+
+def graph_w(tree: list[TurnView], pos: dict[int, dict[str, float]]) -> float {
+    m = 0.0;
+    for v in tree {
+        xv = pos[v.id]["x"] as float;
+        if xv > m {
+            m = xv;
+        }
+    }
+    return MX * 2.0 + m * COLW + 180.0;
+}
+
+def graph_h(tree: list[TurnView], pos: dict[int, dict[str, float]]) -> float {
+    m = 0.0;
+    for v in tree {
+        yv = pos[v.id]["y"] as float;
+        if yv > m {
+            m = yv;
+        }
+    }
+    return TOPY * 2.0 + m * ROWH + 80.0;
+}
+
+def trunc(s: str, n: int) -> str {
+    return s if len(s) <= n else s[:n] + "…";
+}
+
+def node_class(nid: int, cursor: int, pids: list[int], answer: str) -> str {
+    base = "gnode";
+    if nid == cursor {
         base = base + " current";
+    } elif nid in pids {
+        base = base + " onpath";
     }
     if answer == "" {
         base = base + " proposed";
@@ -180,8 +313,16 @@ def tree_class(id: int, cursor: int, answer: str) -> str {
     return base;
 }
 
-def turn_class(id: int, cursor: int) -> str {
-    return "turn current" if id == cursor else "turn";
+def root_class(pids: list[int]) -> str {
+    return "groot onpath" if 0 in pids else "groot";
+}
+
+def edge_class(cid: int, parent: int, pids: list[int]) -> str {
+    return "gedge onpath" if (cid in pids and parent in pids) else "gedge";
+}
+
+def turn_class(nid: int, cursor: int) -> str {
+    return "turn current" if nid == cursor else "turn";
 }
 
 def compose_hint(cursor: int) -> str {

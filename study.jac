@@ -260,3 +260,53 @@ def find_node(n: int) -> Turn | None {
     w = root spawn Locate(target_id=n);
     return w.found;
 }
+
+# One-call demo seed: a realistic long study session on transformers, written
+# directly to the graph (NO LLM calls, zero tokens). Each root answer is dense
+# and assumes things the learner doesn't know - so they fork to unpack each.
+def:pub seed_demo() -> int {
+    turns: list[tuple[str, str, int]] = [
+        ("How do transformers actually work?",
+         "A transformer processes all tokens at once using self-attention: every token builds a query, key, and value vector, attends to every other token via scaled dot-product attention through a softmax, and this runs in parallel across multiple heads. Positional encodings inject word order, and the whole block is stacked with residual connections and layer norm.",
+         0),
+        ("What are the query, key, and value vectors?",
+         "Each token's embedding is multiplied by three learned weight matrices to produce a query (what this token is looking for), a key (what this token offers), and a value (the information it passes on if attended to). They're just linear projections of the same input into three different roles.",
+         1),
+        ("Why three separate vectors instead of one?",
+         "Splitting roles lets a token ask a different question (query) than the signature it advertises (key), and carry yet different content (value). One shared vector would force 'what I look for', 'how I'm found', and 'what I contribute' to be identical - which collapses the model's expressiveness.",
+         2),
+        ("What does the dot product between a query and a key actually measure?",
+         "It measures alignment: a large dot product means this token's query points in the same direction as that token's key, i.e. they're relevant to each other. That raw relevance score is scaled by 1/sqrt(d) and then turned into attention weights.",
+         2),
+        ("Why apply softmax to the scores instead of using them directly?",
+         "Softmax turns arbitrary real-valued scores into a probability distribution that sums to 1, so each token's attention is a weighted average over all values. It also sharpens the largest scores relative to the rest, letting a token focus while still staying differentiable for training.",
+         4),
+        ("What is positional encoding, and why is it needed at all?",
+         "Self-attention has no built-in notion of order - it sees a set, not a sequence. Positional encodings (fixed sinusoids or learned vectors) are added to token embeddings so that position information is available, letting the model tell 'dog bites man' from 'man bites dog'.",
+         1),
+        ("What does it mean that attention is 'permutation invariant'?",
+         "If you shuffle the input tokens, plain self-attention produces the same set of outputs, just reordered - it can't tell which token came first. That's exactly why positional information must be injected explicitly; the mechanism itself ignores order.",
+         6),
+        ("What is multi-head attention doing that single attention doesn't?",
+         "Multiple heads run attention in parallel, each with its own Q/K/V projections into a different subspace, so one head can track syntax while another tracks coreference, etc. Their outputs are concatenated and mixed - capturing several kinds of relationships at once rather than averaging them into one.",
+         1),
+    ];
+    made: dict[int, Turn] = {};
+    i = 1;
+    for (qq, aa, par) in turns {
+        t = Turn(id=i, question=qq, answer=aa);
+        if par == 0 {
+            root +>: Child() :+> t;
+        } else {
+            made[par] +>: Child() :+> t;
+        }
+        made[i] = t;
+        i += 1;
+    }
+    # cross-branch link: "why three vectors" (node 3) and "multi-head" (node 8)
+    # are the same idea - separate representation subspaces.
+    if 8 in made and 3 in made {
+        made[8] +>: Ref() :+> made[3];
+    }
+    return len(made);
+}
