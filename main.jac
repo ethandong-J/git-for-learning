@@ -3,6 +3,9 @@ import os;
 import sys;
 import from jaclang.byllm.lib { Model, MockLLM }
 
+# The conversation lives entirely on the object-spatial graph:
+#   Turn nodes hang off root; a Child edge is a follow-up (the TREE),
+#   a Ref edge cross-links related turns on other branches (the GRAPH).
 node Turn {
     has id: int;
     has question: str;
@@ -12,13 +15,7 @@ node Turn {
 edge Child {}
 edge Ref {}
 
-obj AskResult {
-    has answer: str;
-    has new_id: int;
-}
-
 glob next_id: int = 0;
-glob node_by_id: dict[int, Turn] = {};
 glob cursor: int = 0;
 
 glob mock_flag: bool = (os.getenv("GFL_MOCK", "0") == "1") or ("--mock" in sys.argv);
@@ -77,13 +74,41 @@ def print_tree(nd: any, depth: int) {
     }
 }
 
+# Object-spatial lookup: instead of a Python-side {id: node} dict, a walker
+# descends the graph from root and finds the node by id. The lookup itself
+# is a graph traversal - computation moves to the data.
+walker Locate {
+    has target_id: int;
+    has found: Turn | None = None;
+
+    can seed with Root entry {
+        visit [->:Child:-> [?:Turn]];
+    }
+
+    can scan with Turn entry {
+        if here.id == self.target_id {
+            self.found = here;
+            disengage;
+        }
+        visit [->:Child:-> [?:Turn]];
+    }
+}
+
+def find_node(n: int) -> Turn | None {
+    w = root spawn Locate(target_id=n);
+    return w.found;
+}
+
 walker Ask {
     has question: str;
     has origin: Turn | None = None;
     has history: list[tuple[str, str]] = [];
     has related: list[tuple[str, str]] = [];
-    has reports: list[AskResult] = [];
+    has answer_text: str = "";
+    has new_id: int = 0;
 
+    # Climb UP the ancestor chain, collecting this branch's turns plus any
+    # Ref-linked neighbours, then generate the answer once we reach root.
     can climb with Turn entry {
         if self.origin is None {
             self.origin = here;
@@ -102,17 +127,15 @@ walker Ask {
 
     can answer with Root entry {
         transcript = build_transcript(self.history, self.related);
-        answer_text = continue_dialogue(transcript, self.question);
+        self.answer_text = continue_dialogue(transcript, self.question);
 
         next_id += 1;
-        new_turn = Turn(id=next_id, question=self.question, answer=answer_text);
-        node_by_id[next_id] = new_turn;
-
+        new_turn = Turn(id=next_id, question=self.question, answer=self.answer_text);
         parent = root if self.origin is None else self.origin;
         parent +>: Child() :+> new_turn;
 
+        self.new_id = next_id;
         cursor = next_id;
-        report AskResult(answer=answer_text, new_id=next_id);
     }
 }
 
@@ -120,7 +143,7 @@ walker Propose {
     has origin: Turn | None = None;
     has history: list[tuple[str, str]] = [];
     has related: list[tuple[str, str]] = [];
-    has reports: list[list[Turn]] = [];
+    has created: list[Turn] = [];
 
     can climb with Turn entry {
         if self.origin is None {
@@ -142,48 +165,50 @@ walker Propose {
         transcript = build_transcript(self.history, self.related);
         questions = propose_followups(transcript);
         parent = root if self.origin is None else self.origin;
-
-        new_turns: list[Turn] = [];
         for q in questions {
             next_id += 1;
             new_turn = Turn(id=next_id, question=q, answer="");
-            node_by_id[next_id] = new_turn;
             parent +>: Child() :+> new_turn;
-            new_turns.append(new_turn);
+            self.created.append(new_turn);
         }
-        report new_turns;
     }
 }
 
+# Session frontier: walk the whole tree, collect the leaf Turns (open threads).
 walker Frontier {
     has leaves: list[Turn] = [];
-    has reports: list[list[Turn]] = [];
 
     can from_root with Root entry {
         visit [->:Child:-> [?:Turn]];
     }
 
     can check with Turn entry {
-        children = [here ->:Child:-> [?:Turn]];
-        if not children {
+        kids = [here ->:Child:-> [?:Turn]];
+        if not kids {
             self.leaves.append(here);
         }
         visit [->:Child:-> [?:Turn]];
     }
+}
 
-    can finish with Root exit {
-        report self.leaves;
+def report_ask(w: Ask) {
+    if w.new_id > 0 {
+        print(f"[{w.new_id}] {w.answer_text}");
+    } else {
+        print("error: no response");
     }
 }
 
 def do_ask(question: str) {
-    target = node_by_id[cursor] if cursor != 0 else root;
-    result = target spawn Ask(question=question);
-    if result.reports {
-        r = result.reports[0];
-        print(f"[{r.new_id}] {r.answer}");
+    if cursor == 0 {
+        report_ask(root spawn Ask(question=question));
     } else {
-        print("error: no response");
+        target = find_node(cursor);
+        if target is None {
+            print(f"cursor node {cursor} not found");
+            return;
+        }
+        report_ask(target spawn Ask(question=question));
     }
 }
 
@@ -191,7 +216,7 @@ def do_goto(n: int) {
     if n == 0 {
         cursor = 0;
         print("cursor -> 0 (root)");
-    } elif n in node_by_id {
+    } elif find_node(n) is not None {
         cursor = n;
         print(f"cursor -> {n}");
     } else {
@@ -205,21 +230,20 @@ def do_tree {
 }
 
 def do_link(a: int, b: int) {
-    if a not in node_by_id or b not in node_by_id {
+    na = find_node(a);
+    nb = find_node(b);
+    if na is not None and nb is not None {
+        na +>: Ref() :+> nb;
+        print(f"linked {a} <-> {b}");
+    } else {
         print("no such node(s)");
-        return;
     }
-    node_by_id[a] +>: Ref() :+> node_by_id[b];
-    print(f"linked {a} <-> {b}");
 }
 
-def do_spawn {
-    target = node_by_id[cursor] if cursor != 0 else root;
-    result = target spawn Propose();
-    if result.reports {
-        options = result.reports[0];
+def report_propose(w: Propose) {
+    if w.created {
         print("proposed follow-ups (goto <id> then ask to pursue):");
-        for opt in options {
+        for opt in w.created {
             print(f"  [{opt.id}] {opt.question}");
         }
     } else {
@@ -227,16 +251,26 @@ def do_spawn {
     }
 }
 
+def do_spawn {
+    if cursor == 0 {
+        report_propose(root spawn Propose());
+    } else {
+        target = find_node(cursor);
+        if target is None {
+            print(f"cursor node {cursor} not found");
+            return;
+        }
+        report_propose(target spawn Propose());
+    }
+}
+
 def print_frontier {
-    result = root spawn Frontier();
-    if result.reports {
-        leaves = result.reports[0];
-        if leaves {
-            print("open threads:");
-            for lf in leaves {
-                preview = lf.question[:50];
-                print(f"  [{lf.id}] {preview}");
-            }
+    w = root spawn Frontier();
+    if w.leaves {
+        print("open threads:");
+        for lf in w.leaves {
+            preview = lf.question[:50];
+            print(f"  [{lf.id}] {preview}");
         }
     }
 }
